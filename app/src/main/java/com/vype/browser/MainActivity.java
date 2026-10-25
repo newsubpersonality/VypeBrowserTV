@@ -4,6 +4,7 @@ import android.app.*;
 import android.os.*;
 import android.content.*;
 import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.view.*;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.*;
@@ -17,6 +18,16 @@ public class MainActivity extends Activity {
     LinearLayout root, toolbar, tabsBar, content;
     EditText address;
     WebView web;
+    FrameLayout pageFrame;
+    TextView cursorView, reloadButton;
+    View fullscreenView;
+    WebChromeClient.CustomViewCallback fullscreenCallback;
+    FrameLayout fullscreenHost;
+    boolean cursorMode=false, loading=false;
+    float cursorX=300, cursorY=250;
+    final Handler uiHandler=new Handler(Looper.getMainLooper());
+    final Runnable hideVideoChrome=()->{if(fullscreenView!=null)hideSystemUi();};
+
     int active = 0;
     android.content.SharedPreferences prefs;
     static class Tab { String url, title; Tab(String u,String t){url=u;title=t;} }
@@ -36,10 +47,12 @@ public class MainActivity extends Activity {
         toolbar=new LinearLayout(this);toolbar.setGravity(Gravity.CENTER_VERTICAL);root.addView(toolbar,new LinearLayout.LayoutParams(-1,dp(56)));
         toolbar.addView(button("◀",()->{if(web!=null&&web.canGoBack())web.goBack();}));
         toolbar.addView(button("▶",()->{if(web!=null&&web.canGoForward())web.goForward();}));
-        toolbar.addView(button("⟳",()->{if(web!=null)web.reload();}));
+        reloadButton=button("⟳",()->{if(web!=null){if(loading)web.stopLoading();else web.reload();}});
+        toolbar.addView(reloadButton);
         address=new EditText(this);address.setSingleLine(true);address.setTextColor(Color.WHITE);address.setHintTextColor(Color.LTGRAY);address.setHint("Адрес или поиск");address.setHint("Адрес или поиск");address.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_URI);address.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_GO);
         toolbar.addView(address,new LinearLayout.LayoutParams(0,dp(52),1));address.setOnEditorActionListener((v,id,event)->{navigate(address.getText().toString());((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(address.getWindowToken(),0);address.clearFocus();return true;});
         toolbar.addView(button("★",this::addBookmark));toolbar.addView(button("☰",this::showMenu));
+        toolbar.addView(button("⌖",()->toggleCursor()));
         content=new LinearLayout(this);root.addView(content,new LinearLayout.LayoutParams(-1,0,1));refreshTabs();
     }
     void refreshTabs(){tabsBar.removeAllViews();HorizontalScrollView scroll=new HorizontalScrollView(this);scroll.setHorizontalScrollBarEnabled(false);tabsBar.addView(scroll,new LinearLayout.LayoutParams(0,-1,1));LinearLayout inner=new LinearLayout(this);scroll.addView(inner);
@@ -47,14 +60,56 @@ public class MainActivity extends Activity {
         tabsBar.addView(button("＋",()->{tabs.add(new Tab("https://www.google.com","Новая вкладка"));switchTab(tabs.size()-1);}));
         tabsBar.addView(button("×",this::closeTab));
     }
-    void switchTab(int index){if(index<0||index>=tabs.size())return;if(web!=null){web.stopLoading();web.destroy();web=null;}active=index;content.removeAllViews();web=new WebView(this);web.setFocusable(true);web.setFocusableInTouchMode(true);content.addView(web,new LinearLayout.LayoutParams(-1,-1));
+    void switchTab(int index){if(index<0||index>=tabs.size())return;if(fullscreenView!=null)exitFullscreen();if(web!=null){web.stopLoading();web.destroy();web=null;}active=index;content.removeAllViews();pageFrame=new FrameLayout(this);content.addView(pageFrame,new LinearLayout.LayoutParams(-1,-1));
+        web=new WebView(this);web.setFocusable(true);web.setFocusableInTouchMode(true);pageFrame.addView(web,new FrameLayout.LayoutParams(-1,-1));
+        cursorView=new TextView(this);cursorView.setText("➤");cursorView.setTextSize(28);cursorView.setTextColor(Color.YELLOW);
+        cursorView.setShadowLayer(3,1,1,Color.BLACK);cursorView.setVisibility(cursorMode?View.VISIBLE:View.GONE);
+        FrameLayout.LayoutParams cp=new FrameLayout.LayoutParams(dp(48),dp(48));pageFrame.addView(cursorView,cp);
+        pageFrame.post(()->updateCursor());
         WebSettings s=web.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setDatabaseEnabled(true);s.setJavaScriptCanOpenWindowsAutomatically(false);s.setSupportMultipleWindows(false);s.setLoadWithOverviewMode(true);s.setUseWideViewPort(true);s.setMediaPlaybackRequiresUserGesture(false);s.setCacheMode(WebSettings.LOAD_DEFAULT);s.setBuiltInZoomControls(true);s.setDisplayZoomControls(false);
         CookieManager.getInstance().setAcceptCookie(true);
-        web.setWebViewClient(new WebViewClient(){@Override public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest request){return !request.getUrl().getScheme().equals("http")&&!request.getUrl().getScheme().equals("https");}
-            @Override public void onPageFinished(WebView view,String url){if(view!=web)return;tabs.get(active).url=url;address.setText(url);record(url,view.getTitle());save();}});
-        web.setWebChromeClient(new WebChromeClient(){@Override public void onReceivedTitle(WebView view,String title){if(view!=web)return;tabs.get(active).title=title==null?"Вкладка":title;refreshTabs();save();}
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web,true);
+        web.setWebViewClient(new WebViewClient(){
+            @Override public void onPageStarted(WebView view,String url,android.graphics.Bitmap favicon){if(view!=web)return;setLoading(true);address.setText(url);}
+            @Override public void onReceivedError(WebView view,WebResourceRequest request,WebResourceError error){if(view==web&&request.isForMainFrame())setLoading(false);}
+@Override public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest request){return !request.getUrl().getScheme().equals("http")&&!request.getUrl().getScheme().equals("https");}
+            @Override public void onPageFinished(WebView view,String url){if(view!=web)return;setLoading(false);tabs.get(active).url=url;address.setText(url);record(url,view.getTitle());save();}});
+        web.setWebChromeClient(new WebChromeClient(){
+            @Override public void onProgressChanged(WebView view,int progress){if(view==web)setLoading(progress<100);}
+            @Override public void onShowCustomView(View view,CustomViewCallback callback){enterFullscreen(view,callback);}
+            @Override public void onHideCustomView(){exitFullscreen();}
+@Override public void onReceivedTitle(WebView view,String title){if(view!=web)return;tabs.get(active).title=title==null?"Вкладка":title;refreshTabs();save();}
             @Override public void onPermissionRequest(PermissionRequest request){request.deny();}});
         address.setText(tabs.get(active).url);web.loadUrl(tabs.get(active).url);refreshTabs();save();
+    }
+    void setLoading(boolean state){loading=state;if(reloadButton!=null){reloadButton.setText(state?"×":"⟳");reloadButton.setContentDescription(state?"Остановить загрузку":"Обновить страницу");}}
+    void toggleCursor(){cursorMode=!cursorMode;if(cursorView!=null){cursorView.setVisibility(cursorMode?View.VISIBLE:View.GONE);updateCursor();}Toast.makeText(this,cursorMode?"Курсор включён: стрелки — движение, OK — нажатие":"Курсор выключен",Toast.LENGTH_SHORT).show();}
+    void updateCursor(){if(cursorView==null||pageFrame==null)return;cursorX=Math.max(0,Math.min(cursorX,Math.max(0,pageFrame.getWidth()-dp(40))));cursorY=Math.max(0,Math.min(cursorY,Math.max(0,pageFrame.getHeight()-dp(40))));cursorView.setX(cursorX);cursorView.setY(cursorY);}
+    void clickCursor(){if(web==null)return;long t=android.os.SystemClock.uptimeMillis();float x=cursorX+dp(8),y=cursorY+dp(8);web.dispatchTouchEvent(MotionEvent.obtain(t,t,MotionEvent.ACTION_DOWN,x,y,0));web.dispatchTouchEvent(MotionEvent.obtain(t,t+75,MotionEvent.ACTION_UP,x,y,0));}
+    @Override public boolean dispatchKeyEvent(KeyEvent event){
+        if(fullscreenView!=null){if(event.getAction()==KeyEvent.ACTION_DOWN){if(event.getKeyCode()==KeyEvent.KEYCODE_BACK){exitFullscreen();return true;}showSystemUiTemporarily();}return super.dispatchKeyEvent(event);}
+        if(cursorMode&&event.getAction()==KeyEvent.ACTION_DOWN){int key=event.getKeyCode();int step=dp(32);
+            if(key==KeyEvent.KEYCODE_DPAD_LEFT){cursorX-=step;updateCursor();return true;}
+            if(key==KeyEvent.KEYCODE_DPAD_RIGHT){cursorX+=step;updateCursor();return true;}
+            if(key==KeyEvent.KEYCODE_DPAD_UP){cursorY-=step;updateCursor();return true;}
+            if(key==KeyEvent.KEYCODE_DPAD_DOWN){cursorY+=step;updateCursor();return true;}
+            if(key==KeyEvent.KEYCODE_DPAD_CENTER||key==KeyEvent.KEYCODE_ENTER){clickCursor();return true;}
+        }return super.dispatchKeyEvent(event);
+    }
+    void hideSystemUi(){getWindow().getDecorView().setSystemUiVisibility(5894|1024|512);}
+    void showSystemUiTemporarily(){getWindow().getDecorView().setSystemUiVisibility(0);uiHandler.removeCallbacks(hideVideoChrome);uiHandler.postDelayed(hideVideoChrome,3500);}
+    void enterFullscreen(View view,WebChromeClient.CustomViewCallback callback){
+        if(fullscreenView!=null){callback.onCustomViewHidden();return;}
+        fullscreenView=view;fullscreenCallback=callback;
+        fullscreenHost=new FrameLayout(this);fullscreenHost.setBackgroundColor(Color.BLACK);
+        fullscreenHost.addView(view,new FrameLayout.LayoutParams(-1,-1));
+        getWindow().addContentView(fullscreenHost,new ViewGroup.LayoutParams(-1,-1));
+        root.setVisibility(View.GONE);hideSystemUi();
+    }
+    void exitFullscreen(){if(fullscreenView==null)return;uiHandler.removeCallbacks(hideVideoChrome);
+        if(fullscreenHost!=null){fullscreenHost.removeView(fullscreenView);((ViewGroup)fullscreenHost.getParent()).removeView(fullscreenHost);fullscreenHost=null;}
+        fullscreenView=null;root.setVisibility(View.VISIBLE);getWindow().getDecorView().setSystemUiVisibility(0);
+        if(fullscreenCallback!=null){fullscreenCallback.onCustomViewHidden();fullscreenCallback=null;}
     }
     void navigate(String text){text=text.trim();if(text.isEmpty())return;String url;if(text.matches("(?i)^https?://.*"))url=text;else if(text.contains(".")&&!text.contains(" "))url="https://"+text;else url="https://www.google.com/search?q="+android.net.Uri.encode(text);web.loadUrl(url);}
     void record(String url,String title){if(url==null||url.isEmpty())return;try{JSONObject o=new JSONObject();o.put("url",url);o.put("title",title==null?url:title);o.put("time",System.currentTimeMillis());history.add(0,o);while(history.size()>300)history.remove(history.size()-1);}catch(Exception ignored){}}
@@ -63,8 +118,8 @@ public class MainActivity extends Activity {
     void showEntries(ArrayList<JSONObject> entries,String title){String[] names=new String[entries.size()];for(int i=0;i<entries.size();i++)names[i]=entries.get(i).optString("title",entries.get(i).optString("url"));new AlertDialog.Builder(this).setTitle(title).setItems(names,(d,i)->{String url=entries.get(i).optString("url");if(web!=null)web.loadUrl(url);}).setNeutralButton("Удалить / изменить",(d,w)->manageEntries(entries,title)).setNegativeButton("Закрыть",null).show();}
     void manageEntries(ArrayList<JSONObject> entries,String title){String[] names=new String[entries.size()];for(int i=0;i<entries.size();i++)names[i]=entries.get(i).optString("title");new AlertDialog.Builder(this).setTitle("Выберите запись").setItems(names,(d,i)->{String[] actions=entries==bookmarks?new String[]{"Переименовать","Удалить"}:new String[]{"Удалить"};new AlertDialog.Builder(this).setItems(actions,(dialog,action)->{if(entries==bookmarks&&action==0){EditText input=new EditText(this);input.setText(entries.get(i).optString("title"));new AlertDialog.Builder(this).setTitle("Название").setView(input).setPositiveButton("Сохранить",(x,y)->{try{entries.get(i).put("title",input.getText().toString());save();}catch(Exception ignored){}}).setNegativeButton("Отмена",null).show();}else{entries.remove(i);save();}}).show();}).setNegativeButton("Назад",null).show();}
     void closeTab(){if(tabs.size()==1){tabs.set(0,new Tab("https://www.google.com","Главная"));switchTab(0);return;}tabs.remove(active);switchTab(Math.min(active,tabs.size()-1));}
-    @Override public void onBackPressed(){if(web!=null&&web.canGoBack())web.goBack();else new AlertDialog.Builder(this).setMessage("Выйти из браузера?").setPositiveButton("Выйти",(d,w)->finish()).setNegativeButton("Отмена",null).show();}
+    @Override public void onBackPressed(){if(fullscreenView!=null){exitFullscreen();return;}if(cursorMode){toggleCursor();return;}if(web!=null&&web.canGoBack())web.goBack();else new AlertDialog.Builder(this).setMessage("Выйти из браузера?").setPositiveButton("Выйти",(d,w)->finish()).setNegativeButton("Отмена",null).show();}
     @Override protected void onPause(){super.onPause();save();if(web!=null)web.onPause();}
     @Override protected void onResume(){super.onResume();if(web!=null)web.onResume();}
-    @Override protected void onDestroy(){if(web!=null){web.destroy();web=null;}super.onDestroy();}
+    @Override protected void onDestroy(){uiHandler.removeCallbacks(hideVideoChrome);if(fullscreenView!=null)exitFullscreen();if(web!=null){web.destroy();web=null;}super.onDestroy();}
 }
